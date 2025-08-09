@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Simplified monitoring stack for Social Media Recommendation System
+
+Parameters:
+  RecommendationsLambdaName:
+    Type: String
+    Default: RecommendationsHandler-RecommendationApiStack
+    Description: Name of the Lambda function for recommendations
+  InteractionsLambdaName:
+    Type: String
+    Default: RecordInteractionHandler-RecommendationApiStack
+    Description: Name of the Lambda function for interactions
+  UploadLambdaName:
+    Type: String
+    Default: PostUploadHandler-UploadApiStack
+    Description: Name of the Lambda function for post uploads
+  SageMakerEndpointName:
+    Type: String
+    Default: TwoTowersEndpoint-MlPipeline
+    Description: Name of the SageMaker endpoint
+  NotificationEmail:
+    Type: String
+    Description: Email address for SNS notifications
+    AllowedPattern: ^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$
+    ConstraintDescription: Must be a valid email address
+
+Resources:
+  # SNS Topic for Notifications
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: RecommendationErrorNotifications
+      DisplayName: Recommendation Error Notifications
+
+  # SNS Subscription for Email
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref SNSTopic
+
+  # CloudWatch Alarms for Lambda Functions
+  RecommendationsLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: RecommendationsLambdaErrors
+      AlarmDescription: Errors in Recommendations Lambda
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecommendationsLambdaName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref SNSTopic]
+      TreatMissingData: notBreaching
+
+  InteractionsLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: InteractionsLambdaErrors
+      AlarmDescription: Errors in Interactions Lambda
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref InteractionsLambdaName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref SNSTopic]
+      TreatMissingData: notBreaching
+
+  UploadLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: UploadLambdaErrors
+      AlarmDescription: Errors in Post Upload Lambda
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref UploadLambdaName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref SNSTopic]
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for SageMaker Endpoint
+  SageMakerEndpointErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: SageMakerEndpointErrors
+      AlarmDescription: High latency in SageMaker Endpoint
+      MetricName: ModelLatency
+      Namespace: AWS/SageMaker
+      Dimensions:
+        - Name: EndpointName
+          Value: !Ref SageMakerEndpointName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1000000
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref SNSTopic]
+      TreatMissingData: notBreaching
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS Topic for error notifications
+    Value: !Ref SNSTopic

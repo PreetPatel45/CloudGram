@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Social media post upload service with Cognito, S3, Lambda, API Gateway, and DynamoDB
+
+Resources:
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'SocialMediaUserPool-${AWS::StackName}'
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: false
+          RequireLowercase: false
+    Metadata:
+      Description: Cognito User Pool for user authentication
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'SocialMediaClient-${AWS::StackName}'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+    Metadata:
+      Description: Cognito User Pool Client for frontend authentication
+
+  PostImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: post-images-socialmedia-us-east-1
+      AccessControl: Private
+    Metadata:
+      Description: S3 bucket for storing user-uploaded post images
+
+  PostImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PostImagesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: arn:aws:iam::899888865461:role/LabRole
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Join ['', ['arn:aws:s3:::', !Ref PostImagesBucket, '/*']]
+    Metadata:
+      Description: Policy to allow Lambda to write to S3 bucket
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'UsersTable-${AWS::StackName}'
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+    Metadata:
+      Description: DynamoDB table for user data with user_id as key
+
+  PostsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'PostsTable-${AWS::StackName}'
+      AttributeDefinitions:
+        - AttributeName: post_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: N
+      KeySchema:
+        - AttributeName: post_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserPostsIndex
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 2
+            WriteCapacityUnits: 2
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+    Metadata:
+      Description: DynamoDB table for post metadata with post_id as key and GSI for user_id
+
+  UploadPostLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'UploadPostHandler-${AWS::StackName}'
+      Handler: index.handler
+      Role: arn:aws:iam::899888865461:role/LabRole
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import uuid
+          import time
+          from botocore.exceptions import ClientError
+
+          s3_client = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+
+          def handler(event, context):
+              try:
+                  # Extract user_id from Cognito token
+                  user_id = event['requestContext']['authorizer']['claims']['sub']
+                  body = json.loads(event['body'])
+                  image_b64 = body.get('image')
+                  tags = body.get('tags', [])
+                  username = body.get('username', user_id)
+                  if not image_b64:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('Missing image data'),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                          }
+                      }
+
+                  # Decode and upload image to S3
+                  post_id = str(uuid.uuid4())
+                  image_data = base64.b64decode(image_b64.split(',')[1])  # Remove data URI prefix
+                  s3_key = f'posts/{user_id}/{post_id}.jpg'
+                  s3_client.put_object(
+                      Bucket='post-images-socialmedia-us-east-1',
+                      Key=s3_key,
+                      Body=image_data,
+                      ContentType='image/jpeg'
+                  )
+                  s3_url = f'https://post-images-socialmedia-us-east-1.s3.amazonaws.com/{s3_key}'
+
+                  # Save post metadata to PostsTable
+                  posts_table = dynamodb.Table(f'PostsTable-{context.function_name.split("-")[1]}')
+                  created_at = int(time.time())
+                  posts_table.put_item(
+                      Item={
+                          'post_id': post_id,
+                          'user_id': user_id,
+                          'created_at': created_at,
+                          'tags': tags,
+                          's3_url': s3_url
+                      }
+                  )
+
+                  # Update or create user in UsersTable
+                  users_table = dynamodb.Table(f'UsersTable-{context.function_name.split("-")[1]}')
+                  users_table.update_item(
+                      Key={'user_id': user_id},
+                      UpdateExpression='SET username = :u, updated_at = :t',
+                      ExpressionAttributeValues={
+                          ':u': username,
+                          ':t': created_at
+                      }
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'post_id': post_id, 's3_url': s3_url}),
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                          'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                      }
+                  }
+              except ClientError as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(str(e)),
+                      'headers': {'Access-Control-Allow-Origin': '*'}
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Unexpected error: {str(e)}'),
+                      'headers': {'Access-Control-Allow-Origin': '*'}
+                  }
+      Environment:
+        Variables:
+          POST_IMAGES_BUCKET: !Ref PostImagesBucket
+          POSTS_TABLE: !Ref PostsTable
+          USERS_TABLE: !Ref UsersTable
+    Metadata:
+      Description: Lambda function for post uploads to S3 and DynamoDB
+
+  PostApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'SocialMediaPostApi-${AWS::StackName}'
+      Description: API for social media post uploads
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+    Metadata:
+      Description: API Gateway REST API for post uploads
+
+  PostResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PostApi
+      ParentId: !GetAtt PostApi.RootResourceId
+      PathPart: post
+    Metadata:
+      Description: /post resource for API Gateway
+
+  PostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostApi
+      ResourceId: !Ref PostResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadPostLambda.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+        - StatusCode: 400
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+        - StatusCode: 401
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+    Metadata:
+      Description: POST method for /post resource with Cognito authorization
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub 'CognitoAuthorizer-${AWS::StackName}'
+      RestApiId: !Ref PostApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+    Metadata:
+      Description: Cognito authorizer for API Gateway
+
+  PostOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostApi
+      ResourceId: !Ref PostResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+    Metadata:
+      Description: OPTIONS method for CORS support
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UploadPostLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PostApi}/*/*/post'
+    Metadata:
+      Description: Granting API Gateway permission to invoke Lambda
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostMethod
+      - PostOptionsMethod
+    Properties:
+      RestApiId: !Ref PostApi
+      StageName: prod
+    Metadata:
+      Description: Deploying API Gateway to prod stage
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint for post uploads
+    Value: !Sub 'https://${PostApi}.execute-api.${AWS::Region}.amazonaws.com/prod/post'
+  S3BucketName:
+    Description: S3 Bucket for post images
+    Value: !Ref PostImagesBucket
+  PostsTableName:
+    Description: DynamoDB Posts Table Name
+    Value: !Ref PostsTable
+  UsersTableName:
+    Description: DynamoDB Users Table Name
+    Value: !Ref UsersTable
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+  CognitoClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient

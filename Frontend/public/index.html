@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Social Media App</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@19/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@19/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/axios@1/dist/axios.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@aws-amplify/core@6/lib/index.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@aws-amplify/auth@6/lib/index.min.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module">
+    import React, { useState, useEffect } from 'https://cdn.jsdelivr.net/npm/react@19/umd/react.production.min.js';
+    import ReactDOM from 'https://cdn.jsdelivr.net/npm/react-dom@19/umd/react-dom.production.min.js';
+    import { Amplify, Auth } from 'https://cdn.jsdelivr.net/npm/@aws-amplify/core@6/+esm';
+    import { fetchAuthSession, signIn, signOut } from 'https://cdn.jsdelivr.net/npm/@aws-amplify/auth@6/+esm';
+    import axios from 'https://cdn.jsdelivr.net/npm/axios@1/dist/axios.min.js';
+
+    // Configure Amplify
+    Amplify.configure({
+      Auth: {
+        region: 'us-east-1',
+        userPoolId: 'us-east-1_9yQ9DRlck',
+        userPoolWebClientId: '7olhmn52tq167phb388nt2k0v',
+        mandatorySignIn: true,
+      },
+    });
+
+    // Main App Component
+    const App = () => {
+      const [user, setUser] = useState(null);
+      const [email, setEmail] = useState('');
+      const [password, setPassword] = useState('');
+      const [posts, setPosts] = useState([]);
+      const [file, setFile] = useState(null);
+      const [tags, setTags] = useState('');
+      const [error, setError] = useState('');
+
+      // Check if user is authenticated
+      useEffect(() => {
+        const checkUser = async () => {
+          try {
+            const session = await fetchAuthSession();
+            setUser(session);
+            if (session.tokens) {
+              fetchRecommendations(session.tokens.idToken.toString());
+            }
+          } catch (err) {
+            setUser(null);
+          }
+        };
+        checkUser();
+      }, []);
+
+      // Fetch recommendations
+      const fetchRecommendations = async (idToken) => {
+        try {
+          const response = await axios.get(
+            'https://c9ux2h6cf0.execute-api.us-east-1.amazonaws.com/prod/recommendations',
+            { headers: { Authorization: `Bearer ${idToken}` } }
+          );
+          setPosts(response.data.posts || []);
+          setError('');
+        } catch (err) {
+          setError('Failed to fetch recommendations: ' + err.message);
+          console.error(err);
+        }
+      };
+
+      // Handle login
+      const handleLogin = async (e) => {
+        e.preventDefault();
+        try {
+          await signIn({ username: email, password });
+          const session = await fetchAuthSession();
+          setUser(session);
+          fetchRecommendations(session.tokens.idToken.toString());
+          setError('');
+        } catch (err) {
+          setError('Login failed: ' + err.message);
+        }
+      };
+
+      // Handle logout
+      const handleLogout = async () => {
+        try {
+          await signOut();
+          setUser(null);
+          setPosts([]);
+          setError('');
+        } catch (err) {
+          setError('Logout failed: ' + err.message);
+        }
+      };
+
+      // Handle interaction
+      const handleInteraction = async (postId, interactionType) => {
+        try {
+          const session = await fetchAuthSession();
+          await axios.post(
+            'https://c9ux2h6cf0.execute-api.us-east-1.amazonaws.com/prod/interactions',
+            { post_id: postId, interaction_type: interactionType },
+            { headers: { Authorization: `Bearer ${session.tokens.idToken.toString()}` } }
+          );
+          fetchRecommendations(session.tokens.idToken.toString());
+          setError('');
+        } catch (err) {
+          setError('Interaction failed: ' + err.message);
+        }
+      };
+
+      // Handle file upload
+      const handleUpload = async (e) => {
+        e.preventDefault();
+        if (!file || !tags) {
+          setError('Please select a file and add tags');
+          return;
+        }
+        try {
+          const session = await fetchAuthSession();
+          const formData = new FormData();
+          formData.append('file', file);
+          formData.append('tags', tags);
+          await axios.post(
+            'https://t08crqdnkb.execute-api.us-east-1.amazonaws.com/prod/post',
+            formData,
+            {
+              headers: {
+                Authorization: `Bearer ${session.tokens.idToken.toString()}`,
+                'Content-Type': 'multipart/form-data',
+              },
+            }
+          );
+          setFile(null);
+          setTags('');
+          setError('');
+          fetchRecommendations(session.tokens.idToken.toString());
+        } catch (err) {
+          setError('Upload failed: ' + err.message);
+        }
+      };
+
+      return (
+        <div className="container my-4">
+          {!user ? (
+            <div className="card mx-auto" style={{ maxWidth: '400px' }}>
+              <div className="card-body">
+                <h2 className="card-title text-center mb-4">Login</h2>
+                <form onSubmit={handleLogin}>
+                  <div className="mb-3">
+                    <label className="form-label">Email</label>
+                    <input
+                      type="email"
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      className="form-control"
+                      required
+                    />
+                  </div>
+                  <div className="mb-3">
+                    <label className="form-label">Password</label>
+                    <input
+                      type="password"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      className="form-control"
+                      required
+                    />
+                  </div>
+                  <button type="submit" className="btn btn-primary w-100">
+                    Login
+                  </button>
+                </form>
+                {error && <p className="text-danger mt-3">{error}</p>}
+              </div>
+            </div>
+          ) : (
+            <div>
+              <div className="d-flex justify-content-between align-items-center mb-4">
+                <h2>Social Media App</h2>
+                <button onClick={handleLogout} className="btn btn-danger">
+                  Logout
+                </button>
+              </div>
+              <div className="card mb-4">
+                <div className="card-body">
+                  <h3 className="card-title">Upload Post</h3>
+                  <form onSubmit={handleUpload}>
+                    <div className="mb-3">
+                      <label className="form-label">Image</label>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => setFile(e.target.files[0])}
+                        className="form-control"
+                      />
+                    </div>
+                    <div className="mb-3">
+                      <label className="form-label">Tags (comma-separated)</label>
+                      <input
+                        type="text"
+                        value={tags}
+                        onChange={(e) => setTags(e.target.value)}
+                        className="form-control"
+                        placeholder="e.g., nature,travel"
+                      />
+                    </div>
+                    <button type="submit" className="btn btn-success">
+                      Upload
+                    </button>
+                  </form>
+                  {error && <p className="text-danger mt-3">{error}</p>}
+                </div>
+              </div>
+              <h3 className="mb-3">Recommendations</h3>
+              <div className="row">
+                {posts.map((post) => (
+                  <div key={post.post_id} className="col-md-4 mb-4">
+                    <div className="card">
+                      <img src={post.s3_url} className="card-img-top" alt="Post" style={{ height: '200px', objectFit: 'cover' }} />
+                      <div className="card-body">
+                        <p className="card-text">Posted by: {post.user_id}</p>
+                        <p className="card-text">Tags: {post.tags.join(', ')}</p>
+                        <p className="card-text">
+                          Created: {new Date(post.created_at * 1000).toLocaleString()}
+                        </p>
+                        <div className="d-flex gap-2">
+                          <button
+                            onClick={() => handleInteraction(post.post_id, 'like')}
+                            className="btn btn-primary btn-sm"
+                          >
+                            Like
+                          </button>
+                          <button
+                            onClick={() => handleInteraction(post.post_id, 'next')}
+                            className="btn btn-secondary btn-sm"
+                          >
+                            Next
+                          </button>
+                          <button
+                            onClick={() => handleInteraction(post.post_id, 'previous')}
+                            className="btn btn-secondary btn-sm"
+                          >
+                            Previous
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {posts.length === 0 && <p>No recommendations available</p>}
+            </div>
+          )}
+        </div>
+      );
+    };
+
+    // Render the app
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>

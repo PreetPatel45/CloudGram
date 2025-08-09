@@ -1,0 +1,451 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: API Gateway and Lambda for social media recommendation and interaction recording
+
+Parameters:
+  ExistingPostsTableName:
+    Type: String
+    Default: PostsTable-UploadApiStack
+    Description: Existing DynamoDB PostsTable
+  ExistingInteractionsTableName:
+    Type: String
+    Default: InteractionsTable-MlPipeline
+    Description: Existing DynamoDB InteractionsTable
+  ExistingCognitoUserPoolArn:
+    Type: String
+    Default: arn:aws:cognito-idp:us-east-1:899888865461:userpool/us-east-1_9yQ9DRlck
+    Description: ARN of existing Cognito User Pool
+  SageMakerEndpointName:
+    Type: String
+    Default: TwoTowersEndpoint-MlPipeline
+    Description: Name of SageMaker endpoint for recommendations
+
+Resources:
+  RecommendationApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'RecommendationApi-${AWS::StackName}'
+      Description: API for social media recommendations and interactions
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+    Metadata:
+      Description: API Gateway REST API for recommendations and interactions
+
+  RecommendationsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'RecommendationsHandler-${AWS::StackName}'
+      Handler: index.handler
+      Role: arn:aws:iam::899888865461:role/LabRole
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          sagemaker_runtime = boto3.client('sagemaker-runtime')
+
+          def decimal_default(obj):
+              """JSON serializer function that handles Decimal objects"""
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+          def convert_decimals(obj):
+              """Recursively convert Decimal objects to float in nested structures"""
+              if isinstance(obj, list):
+                  return [convert_decimals(item) for item in obj]
+              elif isinstance(obj, dict):
+                  return {key: convert_decimals(value) for key, value in obj.items()}
+              elif isinstance(obj, Decimal):
+                  return float(obj)
+              else:
+                  return obj
+
+          def handler(event, context):
+              try:
+                  # Extract user_id from Cognito token
+                  user_id = event['requestContext']['authorizer']['claims']['sub']
+                  
+                  # Prepare input for SageMaker - only user_id
+                  sagemaker_input = {
+                      'user_id': user_id
+                  }
+
+                  # Invoke SageMaker endpoint using sagemaker-runtime client
+                  sagemaker_response = sagemaker_runtime.invoke_endpoint(
+                      EndpointName=os.environ['SAGEMAKER_ENDPOINT'],
+                      ContentType='application/json',
+                      Body=json.dumps(sagemaker_input)
+                  )
+                  
+                  # Parse the response to get recommendations
+                  result = json.loads(sagemaker_response['Body'].read().decode())
+                  recommended_post_ids = result['recommendations']
+                  
+                  if not recommended_post_ids:
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({'posts': []}),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                              'Access-Control-Allow-Methods': 'GET,OPTIONS'
+                          }
+                      }
+
+                  # Fetch post details from PostsTable
+                  posts_table = dynamodb.Table(os.environ['POSTS_TABLE'])
+                  posts = []
+                  for post_id in recommended_post_ids:
+                      try:
+                          response = posts_table.get_item(Key={'post_id': post_id})
+                          post = response.get('Item')
+                          if post:
+                              # Convert Decimal objects to regular Python types
+                              post = convert_decimals(post)
+                              
+                              # Handle different tag formats
+                              tags = post.get('tags', [])
+                              if isinstance(tags, str):
+                                  try:
+                                      tags = eval(tags)  # Convert string representation to list
+                                  except:
+                                      tags = [tags]
+                              
+                              posts.append({
+                                  'post_id': post['post_id'],
+                                  'user_id': post['user_id'],
+                                  'username': post.get('username', 'Anonymous'),
+                                  'created_at': post['created_at'],
+                                  'tags': tags,
+                                  's3_url': post['s3_url']
+                              })
+                      except Exception as e:
+                          print(f"Error fetching post {post_id}: {str(e)}")
+                          continue
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'posts': posts}, default=decimal_default),
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                          'Access-Control-Allow-Methods': 'GET,OPTIONS'
+                      }
+                  }
+              except ClientError as e:
+                  print(f"ClientError: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'ClientError: {str(e)}'}),
+                      'headers': {'Access-Control-Allow-Origin': '*'}
+                  }
+              except Exception as e:
+                  print(f"Unexpected error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Unexpected error: {str(e)}'}),
+                      'headers': {'Access-Control-Allow-Origin': '*'}
+                  }
+      Environment:
+        Variables:
+          POSTS_TABLE: !Ref ExistingPostsTableName
+          INTERACTIONS_TABLE: !Ref ExistingInteractionsTableName
+          SAGEMAKER_ENDPOINT: !Ref SageMakerEndpointName
+    Metadata:
+      Description: Lambda function to fetch recommendations from SageMaker and post details from DynamoDB
+
+  RecordInteractionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'RecordInteractionHandler-${AWS::StackName}'
+      Handler: index.handler
+      Role: arn:aws:iam::899888865461:role/LabRole
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os  # Add this import
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def handler(event, context):
+              try:
+                  # Extract user_id from Cognito token
+                  user_id = event['requestContext']['authorizer']['claims']['sub']
+                  body = json.loads(event['body'])
+                  post_id = body.get('post_id')
+                  interaction_type = body.get('interaction_type')
+                  
+                  if not post_id or not interaction_type:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('Missing post_id or interaction_type'),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                          }
+                      }
+                  
+                  if interaction_type not in ['like', 'next', 'previous']:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('Invalid interaction_type. Must be like, next, or previous'),
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                              'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                          }
+                      }
+                  
+                  # Save interaction to InteractionsTable
+                  interactions_table = dynamodb.Table(os.environ['INTERACTIONS_TABLE'])
+                  timestamp = int(time.time())
+                  interactions_table.put_item(
+                      Item={
+                          'user_id': user_id,
+                          'post_id': post_id,
+                          'interaction_type': interaction_type,
+                          'timestamp': timestamp
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Interaction recorded', 'user_id': user_id, 'post_id': post_id}),
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                          'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                      }
+                  }
+              except ClientError as e:
+                  print(f"ClientError: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}'),
+                      'headers': {'Access-Control-Allow-Origin': '*'}
+                  }
+              except Exception as e:
+                  print(f"Unexpected error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Unexpected error: {str(e)}'),
+                      'headers': {'Access-Control-Allow-Origin': '*'}
+                  }
+      Environment:
+        Variables:
+          INTERACTIONS_TABLE: !Ref ExistingInteractionsTableName
+    Metadata:
+      Description: Lambda function to record user interactions in DynamoDB
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    DependsOn: RecommendationApi
+    Properties:
+      Name: !Sub 'CognitoAuthorizer-${AWS::StackName}'
+      RestApiId: !Ref RecommendationApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !Ref ExistingCognitoUserPoolArn
+    Metadata:
+      Description: Cognito authorizer for API Gateway
+
+  RecommendationsResource:
+    Type: AWS::ApiGateway::Resource
+    DependsOn: RecommendationApi
+    Properties:
+      RestApiId: !Ref RecommendationApi
+      ParentId: !GetAtt RecommendationApi.RootResourceId
+      PathPart: recommendations
+    Metadata:
+      Description: /recommendations resource for API Gateway
+
+  RecommendationsMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn:
+      - RecommendationsResource
+      - RecommendationsLambda
+      - CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref RecommendationApi
+      ResourceId: !Ref RecommendationsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RecommendationsLambda.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+        - StatusCode: 400
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+        - StatusCode: 401
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+    Metadata:
+      Description: GET method for /recommendations with Cognito authorization
+
+  RecommendationsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: RecommendationsResource
+    Properties:
+      RestApiId: !Ref RecommendationApi
+      ResourceId: !Ref RecommendationsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+    Metadata:
+      Description: OPTIONS method for /recommendations CORS support
+
+  InteractionsResource:
+    Type: AWS::ApiGateway::Resource
+    DependsOn: RecommendationApi
+    Properties:
+      RestApiId: !Ref RecommendationApi
+      ParentId: !GetAtt RecommendationApi.RootResourceId
+      PathPart: interactions
+    Metadata:
+      Description: /interactions resource for API Gateway
+
+  InteractionsMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn:
+      - InteractionsResource
+      - RecordInteractionLambda
+      - CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref RecommendationApi
+      ResourceId: !Ref InteractionsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RecordInteractionLambda.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+        - StatusCode: 400
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+        - StatusCode: 401
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+    Metadata:
+      Description: POST method for /interactions with Cognito authorization
+
+  InteractionsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: InteractionsResource
+    Properties:
+      RestApiId: !Ref RecommendationApi
+      ResourceId: !Ref InteractionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+    Metadata:
+      Description: OPTIONS method for /interactions CORS support
+
+  RecommendationsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - RecommendationsLambda
+      - RecommendationApi
+    Properties:
+      FunctionName: !GetAtt RecommendationsLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RecommendationApi}/*/*/recommendations'
+    Metadata:
+      Description: Permission for API Gateway to invoke RecommendationsLambda
+
+  InteractionsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - RecordInteractionLambda
+      - RecommendationApi
+    Properties:
+      FunctionName: !GetAtt RecordInteractionLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RecommendationApi}/*/*/interactions'
+    Metadata:
+      Description: Permission for API Gateway to invoke RecordInteractionLambda
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - RecommendationsMethod
+      - RecommendationsOptionsMethod
+      - InteractionsMethod
+      - InteractionsOptionsMethod
+    Properties:
+      RestApiId: !Ref RecommendationApi
+      StageName: prod
+    Metadata:
+      Description: Deploying API Gateway to prod stage
+
+Outputs:
+  RecommendationsApiEndpoint:
+    Description: API Gateway endpoint for recommendations
+    Value: !Sub 'https://${RecommendationApi}.execute-api.${AWS::Region}.amazonaws.com/prod/recommendations'
+  InteractionsApiEndpoint:
+    Description: API Gateway endpoint for recording interactions
+    Value: !Sub 'https://${RecommendationApi}.execute-api.${AWS::Region}.amazonaws.com/prod/interactions'

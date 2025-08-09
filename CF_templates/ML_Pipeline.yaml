@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MLOps pipeline for social media recommendation system with EventBridge, Lambda, and SageMaker (S3 trigger, script entry point)
+
+Parameters:
+  ExistingS3BucketName:
+    Type: String
+    Default: post-images-socialmedia-us-east-1
+    Description: Existing S3 bucket for post images and code
+  ExistingPostsTableName:
+    Type: String
+    Default: PostsTable-UploadApiStack
+    Description: Existing DynamoDB PostsTable
+  ExistingUsersTableName:
+    Type: String
+    Default: UsersTable-UploadApiStack
+    Description: Existing DynamoDB UsersTable
+
+Resources:
+  InteractionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: InteractionsTable-MlPipeline
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+    Metadata:
+      Description: DynamoDB table for user interactions with stream enabled
+
+  TrainingTriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TrainingTrigger-MlPipeline
+      Handler: index.handler
+      Role: arn:aws:iam::899888865461:role/LabRole
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+
+          dynamodb = boto3.client('dynamodb')
+          sagemaker = boto3.client('sagemaker')
+
+          def handler(event, context):
+              try:
+                  # Count interactions
+                  response = dynamodb.scan(
+                      TableName=os.environ['INTERACTIONS_TABLE'],
+                      Select='COUNT'
+                  )
+                  count = response['Count']
+                  if count < 10:
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(f'Not enough data: {count} interactions')
+                      }
+
+                  # Start SageMaker training job with unique name
+                  timestamp = str(int(time.time() * 1000))
+                  training_job_name = f'two-towers-training-{timestamp}'
+                  sagemaker.create_training_job(
+                      TrainingJobName=training_job_name,
+                      AlgorithmSpecification={
+                          'TrainingImage': '763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.0.0-cpu-py310',
+                          'TrainingInputMode': 'File'
+                      },
+                      RoleArn=os.environ['SAGEMAKER_ROLE'],
+                      OutputDataConfig={
+                          'S3OutputPath': f's3://{os.environ["S3_BUCKET"]}/models/'
+                      },
+                      ResourceConfig={
+                          'InstanceType': 'ml.m5.large',
+                          'InstanceCount': 1,
+                          'VolumeSizeInGB': 10
+                      },
+                      StoppingCondition={
+                          'MaxRuntimeInSeconds': 3600
+                      },
+                      HyperParameters={
+                          'sagemaker_program': 'two_towers_training.py',
+                          'sagemaker_submit_directory': f's3://{os.environ["S3_BUCKET"]}/code/source.tar.gz'
+                      },
+                      Environment={
+                          'POSTS_TABLE': os.environ['POSTS_TABLE'],
+                          'INTERACTIONS_TABLE': os.environ['INTERACTIONS_TABLE'],
+                          'TRAINING_JOB_NAME': training_job_name,
+                          'S3_BUCKET': os.environ['S3_BUCKET']
+                      },
+                      InputDataConfig=[
+                          {
+                              'ChannelName': 'training',
+                              'DataSource': {
+                                  'S3DataSource': {
+                                      'S3DataType': 'S3Prefix',
+                                      'S3Uri': f's3://{os.environ["S3_BUCKET"]}/code/source.tar.gz',
+                                      'S3DataDistributionType': 'FullyReplicated'
+                                  }
+                              }
+                          }
+                      ]
+                  )
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Started training job: {training_job_name}')
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref ExistingS3BucketName
+          POSTS_TABLE: !Ref ExistingPostsTableName
+          INTERACTIONS_TABLE: !Ref InteractionsTable
+          SAGEMAKER_ROLE: arn:aws:iam::899888865461:role/LabRole
+    Metadata:
+      Description: Lambda to trigger SageMaker training job
+
+  InteractionStreamRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: InteractionStreamTrigger-MlPipeline
+      EventPattern:
+        source:
+          - aws.dynamodb
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - dynamodb.amazonaws.com
+          eventName:
+            - PutItem
+          requestParameters:
+            tableName:
+              - !Ref InteractionsTable
+      Targets:
+        - Arn: !GetAtt TrainingTriggerLambda.Arn
+          Id: TrainingTriggerTarget
+    Metadata:
+      Description: EventBridge rule to trigger training on new interactions
+
+  TrainingTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TrainingTriggerLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt InteractionStreamRule.Arn
+    Metadata:
+      Description: Permission for EventBridge to invoke TrainingTriggerLambda
+
+  SageMakerNotebookInstance:
+    Type: AWS::SageMaker::NotebookInstance
+    Properties:
+      NotebookInstanceName: TwoTowersNotebook-MlPipeline
+      InstanceType: ml.t3.medium
+      RoleArn: arn:aws:iam::899888865461:role/LabRole
+      VolumeSizeInGB: 10
+    Metadata:
+      Description: SageMaker notebook instance for Two Towers training
+
+  ModelDeploymentLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ModelDeployment-MlPipeline
+      Handler: index.handler
+      Role: arn:aws:iam::899888865461:role/LabRole
+      Runtime: python3.11
+      Timeout: 900
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+
+          sagemaker = boto3.client('sagemaker')
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              try:
+                  print("Parsing S3 event")
+                  if 'Records' in event:
+                      s3_record = event['Records'][0]['s3']
+                  elif 'detail' in event:
+                      s3_record = event['detail']
+                  else:
+                      raise ValueError("Invalid event format: No Records or detail found")
+                  
+                  bucket = s3_record['bucket']['name']
+                  key = s3_record['object']['key']
+                  print(f"Bucket: {bucket}, Key: {key}")
+                  
+                  if not key.endswith('model.tar.gz'):
+                      print(f"Skipping non-model file: {key}")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps(f'Skipping non-model file: {key}')
+                      }
+                  
+                  model_path = f's3://{bucket}/{key}'
+                  training_job_name = key.split('/')[1]
+                  model_name = f'two-towers-model-{training_job_name}'[:63]
+                  endpoint_name = os.environ['ENDPOINT_NAME']
+                  print(f"Model path: {model_path}, Model name: {model_name}, Endpoint: {endpoint_name}")
+
+                  print("Verifying model artifact")
+                  s3.head_object(Bucket=bucket, Key=key)
+
+                  print("Cleaning up old resources")
+                  try:
+                      sagemaker.delete_endpoint(EndpointName=endpoint_name)
+                      print(f"Deleted endpoint: {endpoint_name}")
+                      time.sleep(30)
+                  except sagemaker.exceptions.ClientError as e:
+                      print(f"No endpoint to delete: {str(e)}")
+                  
+                  try:
+                      old_models = sagemaker.list_models(NameContains='two-towers-model')
+                      for model in old_models['Models']:
+                          print(f"Deleting model: {model['ModelName']}")
+                          sagemaker.delete_model(ModelName=model['ModelName'])
+                      
+                      old_configs = sagemaker.list_endpoint_configs(NameContains=f'{endpoint_name}-cfg')
+                      for config in old_configs['EndpointConfigs']:
+                          print(f"Deleting endpoint config: {config['EndpointConfigName']}")
+                          sagemaker.delete_endpoint_config(EndpointConfigName=config['EndpointConfigName'])
+                  except Exception as e:
+                      print(f"Error cleaning up: {str(e)}")
+
+                  print("Creating SageMaker model")
+                  sagemaker.create_model(
+                      ModelName=model_name,
+                      PrimaryContainer={
+                          'Image': '763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.0.0-cpu-py310',
+                          'ModelDataUrl': model_path,
+                          'Environment': {
+                              'MMS_DEFAULT_RESPONSE_TIMEOUT': '300',
+                              'MMS_DEFAULT_WORKERS_PER_MODEL': '1',
+                              'SAGEMAKER_MODEL_SERVER_TIMEOUT': '300',
+                              'SAGEMAKER_TS_RESPONSE_TIMEOUT': '300',
+                              'TS_LOG_LEVEL': 'INFO',
+                              'GUNICORN_CMD_ARGS': '--timeout 300 --keep-alive 2 --max-requests 1000',
+                              'PYTHONUNBUFFERED': '1',
+                              'PYTHONPATH': '/opt/ml/code'
+                          }
+                      },
+                      ExecutionRoleArn=os.environ['SAGEMAKER_ROLE']
+                  )
+
+                  print("Creating endpoint configuration")
+                  endpoint_config_name = f'{endpoint_name}-cfg-{training_job_name[-10:]}'
+                  print(f"Endpoint config name: {endpoint_config_name}")
+                  sagemaker.create_endpoint_config(
+                      EndpointConfigName=endpoint_config_name,
+                      ProductionVariants=[
+                          {
+                              'VariantName': 'AllTraffic',
+                              'ModelName': model_name,
+                              'InstanceType': 'ml.c5.xlarge',
+                              'InitialInstanceCount': 1,
+                              'ModelDataDownloadTimeoutInSeconds': 600,
+                              'ContainerStartupHealthCheckTimeoutInSeconds': 600
+                          }
+                      ]
+                  )
+
+                  print("Creating endpoint")
+                  sagemaker.create_endpoint(
+                      EndpointName=endpoint_name,
+                      EndpointConfigName=endpoint_config_name
+                  )
+
+                  print("Waiting for endpoint to be InService")
+                  max_wait_time = 1200
+                  start_time = time.time()
+                  
+                  while True:
+                      current_time = time.time()
+                      if current_time - start_time > max_wait_time:
+                          print("Timeout waiting for endpoint to become InService")
+                          break
+                          
+                      status = sagemaker.describe_endpoint(EndpointName=endpoint_name)['EndpointStatus']
+                      print(f"Endpoint status: {status}")
+                      
+                      if status == 'InService':
+                          print("Endpoint is now InService")
+                          break
+                      elif status == 'Failed':
+                          endpoint_details = sagemaker.describe_endpoint(EndpointName=endpoint_name)
+                          failure_reason = endpoint_details.get('FailureReason', 'Unknown failure')
+                          print(f"Endpoint creation failed: {failure_reason}")
+                          raise Exception(f"Endpoint creation failed: {failure_reason}")
+                      
+                      time.sleep(30)
+
+                  print(f"Deployment complete for endpoint: {endpoint_name}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Deployed model to endpoint: {endpoint_name}')
+                  }
+              except Exception as e:
+                  print(f"Error in deployment: {str(e)}")
+                  import traceback
+                  traceback.print_exc()
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref ExistingS3BucketName
+          SAGEMAKER_ROLE: arn:aws:iam::899888865461:role/LabRole
+          ENDPOINT_NAME: TwoTowersEndpoint-MlPipeline
+    Metadata:
+      Description: Lambda to deploy trained model to SageMaker endpoint
+
+  ModelUploadRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ModelUploadTrigger-MlPipeline
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref ExistingS3BucketName
+          object:
+            key:
+              - prefix: models/
+              - suffix: model.tar.gz
+      Targets:
+        - Arn: !GetAtt ModelDeploymentLambda.Arn
+          Id: ModelDeploymentTarget
+    Metadata:
+      Description: EventBridge rule to trigger model deployment on S3 model upload
+
+  ModelDeploymentPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ModelDeploymentLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ModelUploadRule.Arn
+    Metadata:
+      Description: Permission for EventBridge to invoke ModelDeploymentLambda
+
+Outputs:
+  InteractionsTableName:
+    Description: DynamoDB Interactions Table Name
+    Value: !Ref InteractionsTable
+  NotebookInstanceName:
+    Description: SageMaker Notebook Instance Name
+    Value: !Ref SageMakerNotebookInstance
+  EndpointName:
+    Description: SageMaker Endpoint Name
+    Value: TwoTowersEndpoint-MlPipeline
